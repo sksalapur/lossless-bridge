@@ -44,5 +44,9 @@ async def stream_track(secret: str, track_id: str, request: Request):
     if not stream_url:
         raise HTTPException(status_code=404, detail="Lossless stream not found or invalid")
         
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=stream_url)
+    return {
+        "url": stream_url,
+        "format": "flac",
+        "quality": "Lossless",
+        "audioQuality": "LOSSLESS"
+    }
