@@ -15,7 +15,7 @@ async def stream_proxy(url: str, range_header: str = None):
     if range_header:
         headers["Range"] = range_header
         
-    client = httpx.AsyncClient()
+    client = httpx.AsyncClient(follow_redirects=True)
     
     # Send request upstream
     req = client.build_request("GET", url, headers=headers)
@@ -34,7 +34,13 @@ async def stream_proxy(url: str, range_header: str = None):
             chunk = await resp.aiter_bytes(chunk_size=8192).__anext__()
             val = FLACValidator.validate_header(chunk)
             if not val["is_valid"]:
-                logger.error(f"Stream validation failed: {val['error']}")
+                # Try to decode the chunk as text to see if it's an XML/HTML error message
+                error_body = ""
+                try:
+                    error_body = " - Body: " + chunk[:256].decode("utf-8")
+                except:
+                    pass
+                logger.error(f"Stream validation failed: {val['error']}{error_body}")
                 await resp.aclose()
                 return None
             logger.info(f"Stream validated successfully. Meta: {val['metadata']}")
