@@ -25,7 +25,8 @@ class LastWaveResolver(BaseResolver):
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, params={"q": query, "quality": "27"})
                 if resp.status_code == 200:
-                    return resp.json()
+                    data = resp.json()
+                    return data.get("tracks", [])
         except Exception as e:
             logger.error(f"LastWave resolver search error: {e}")
         return []

@@ -30,10 +30,10 @@ async def get_manifest(secret: str):
 async def search_tracks(secret: str, q: str = ""):
     verify_secret(secret)
     if not q:
-        return []
+        return {"tracks": []}
     
     results = await engine.search(q)
-    return results
+    return {"tracks": results}
 
 @router.get("/{secret}/stream/{track_id}")
 async def stream_track(secret: str, track_id: str, request: Request):
