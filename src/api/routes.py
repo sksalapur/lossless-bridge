@@ -44,17 +44,4 @@ async def stream_track(secret: str, track_id: str, request: Request):
     if not stream_data:
         raise HTTPException(status_code=404, detail="Lossless stream not found or invalid")
         
-    # Dynamically append bit/kHz to the 'quality' string so BitChord displays it in the UI
-    bit_depth = stream_data.get("bitDepth")
-    sample_rate = stream_data.get("sampleRate")
-    
-    if bit_depth and sample_rate:
-        # Convert 96000 to 96.0, 44100 to 44.1
-        khz = sample_rate / 1000.0
-        # Strip .0 if it's a whole number for cleaner display
-        khz_str = f"{khz:g}" 
-        
-        original_quality = stream_data.get("quality", "Lossless")
-        stream_data["quality"] = f"{original_quality} ({bit_depth}-bit / {khz_str} kHz)"
-        
     return stream_data
