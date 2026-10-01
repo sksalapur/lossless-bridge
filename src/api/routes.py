@@ -39,9 +39,10 @@ async def search_tracks(secret: str, q: str = ""):
 async def stream_track(secret: str, track_id: str, request: Request):
     verify_secret(secret)
     
-    stream_response = await engine.get_stream(track_id, request.headers.get("Range"))
+    stream_url = await engine.get_stream(track_id, request.headers.get("Range"))
     
-    if not stream_response:
+    if not stream_url:
         raise HTTPException(status_code=404, detail="Lossless stream not found or invalid")
         
-    return stream_response
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=stream_url)

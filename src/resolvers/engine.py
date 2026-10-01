@@ -50,14 +50,9 @@ class ResolverEngine:
                 logger.warning(f"[{resolver.name}] Prank URL detected, skipping: {stream_url}")
                 continue
                 
-            # Use the streaming proxy to validate and stream
-            try:
-                # The proxy handles Range requests and initial validation
-                response = await stream_proxy(stream_url, range_header)
-                if response:
-                    return response
-            except Exception as e:
-                logger.error(f"[{resolver.name}] Proxy error: {e}")
+            # If it's a legitimate URL (like a pre-signed S3/DASH manifest), 
+            # return it directly so the client can resolve relative DASH segments properly.
+            return stream_url
                 
         # If all fail, return None so the route can throw 404
         return None
