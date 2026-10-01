@@ -39,14 +39,9 @@ async def search_tracks(secret: str, q: str = ""):
 async def stream_track(secret: str, track_id: str, request: Request):
     verify_secret(secret)
     
-    stream_url = await engine.get_stream(track_id, request.headers.get("Range"))
+    stream_data = await engine.get_stream(track_id, request.headers.get("Range"))
     
-    if not stream_url:
+    if not stream_data:
         raise HTTPException(status_code=404, detail="Lossless stream not found or invalid")
         
-    return {
-        "url": stream_url,
-        "format": "flac",
-        "quality": "Lossless",
-        "audioQuality": "LOSSLESS"
-    }
+    return stream_data
