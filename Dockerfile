@@ -9,4 +9,5 @@ COPY . .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "7860"]
+# Use shell form to evaluate the $PORT environment variable injected by Render/Heroku
+CMD uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-3000}
