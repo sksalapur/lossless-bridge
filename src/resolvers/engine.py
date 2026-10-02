@@ -41,19 +41,18 @@ class ResolverEngine:
         """
         # Simply try all resolvers until one gives a valid stream
         for resolver in self.resolvers:
-            stream_data = await resolver.get_stream(composite_track_id)
-            if not stream_data or "url" not in stream_data:
+            stream_url = await resolver.get_stream(composite_track_id)
+            if not stream_url:
                 continue
                 
-            stream_url = stream_data["url"]
             # Quick check if it's a known prank URL
             if "pranks-cdn" in stream_url.lower() or "definatelynagato" in stream_url.lower():
                 logger.warning(f"[{resolver.name}] Prank URL detected, skipping: {stream_url}")
                 continue
                 
             # If it's a legitimate URL (like a pre-signed S3/DASH manifest), 
-            # return the full data dict so the client gets bit/kHz metadata.
-            return stream_data
+            # return it directly so the client can resolve relative DASH segments properly.
+            return stream_url
                 
         # If all fail, return None so the route can throw 404
         return None
