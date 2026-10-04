@@ -145,15 +145,13 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
 
     async def stream_segments():
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Determine which segments to skip by mapping their sizes dynamically.
-            # We ONLY do this if a start_byte > 0 is requested, to save time on normal playback/downloads.
-            skip_bytes = 0
+            bytes_to_skip_globally = start_byte
             start_url_index = 0
             
             if start_byte > 0:
                 logger.info(f"Mapping segment sizes for {track_id} to satisfy Range {start_byte}-")
                 
-                # Fetch sizes concurrently in batches of 10 to avoid overwhelming the CDN
+                # Fetch sizes concurrently in batches of 10
                 sizes = []
                 for i in range(0, len(urls), 10):
                     batch = urls[i:i+10]
@@ -162,31 +160,26 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
                     
                     for size in batch_sizes:
                         if size == 0:
-                            # If a HEAD request fails, fallback to streaming from current point
                             break
                         sizes.append(size)
                     
-                    if len(sizes) < i + len(batch):
-                        break # Stopped early due to failure
+                    if len(sizes) < len(batch):
+                        break # Stopped early due to failure or missing Content-Length
                         
-                    # Check if we've mapped enough bytes
-                    total_mapped = sum(sizes)
-                    if total_mapped > start_byte:
+                    if sum(sizes) > start_byte:
                         break
 
-                # Calculate offset
-                total = 0
+                # Safely skip entire segments that fall completely within the skip range
+                total_mapped = 0
                 for i, size in enumerate(sizes):
-                    if total + size > start_byte:
-                        start_url_index = i
-                        skip_bytes = start_byte - total
+                    if total_mapped + size <= bytes_to_skip_globally:
+                        total_mapped += size
+                        start_url_index = i + 1
+                    else:
                         break
-                    total += size
-                    
-                # If we mapped everything but still didn't reach start_byte (e.g. range out of bounds)
-                if start_url_index == 0 and skip_bytes == 0 and sum(sizes) > 0 and sum(sizes) <= start_byte:
-                    logger.warning(f"Requested start_byte {start_byte} exceeds mapped total size {sum(sizes)}")
-                    return # EOF
+                        
+                bytes_to_skip_globally -= total_mapped
+                logger.info(f"HEAD mapping skipped {start_url_index} segments ({total_mapped} bytes). Remaining to dynamically skip: {bytes_to_skip_globally}")
 
             bytes_yielded = 0
             urls_to_fetch = urls[start_url_index:]
@@ -199,14 +192,14 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
                             break
                             
                         async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            # Skip logic within the exact segment
-                            if skip_bytes > 0:
-                                if len(chunk) <= skip_bytes:
-                                    skip_bytes -= len(chunk)
+                            # Skip logic within the stream
+                            if bytes_to_skip_globally > 0:
+                                if len(chunk) <= bytes_to_skip_globally:
+                                    bytes_to_skip_globally -= len(chunk)
                                     continue
                                 else:
-                                    chunk = chunk[skip_bytes:]
-                                    skip_bytes = 0
+                                    chunk = chunk[bytes_to_skip_globally:]
+                                    bytes_to_skip_globally = 0
                                 
                             # Truncate logic if end_byte is specified
                             if end_byte is not None:
