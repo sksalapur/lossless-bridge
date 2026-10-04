@@ -1,10 +1,40 @@
+# Environment
 .env
+.env.local
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
 .venv/
 env/
 venv/
 ENV/
+
+# Testing
 .pytest_cache/
+htmlcov/
+.coverage
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Logs
 *.log
+
+# Dev/research files
+experiments/
+RESEARCH.md
+BitChord_Lossless_Bridge_Coding_Agent_Handoff.md
