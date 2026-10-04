@@ -88,18 +88,21 @@ async def fetch_and_parse_mpd(mpd_url: str):
     init_url = segment_template.get("initialization").replace("&amp;", "&")
     media_url_template = segment_template.get("media").replace("&amp;", "&")
     start_number = int(segment_template.get("startNumber", "1"))
+    timescale = int(segment_template.get("timescale", "48000"))
     
-    total_segments = 0
+    segment_durations = []
     timeline = segment_template.find(".//SegmentTimeline")
     if timeline is not None:
         for s in timeline.findall("S"):
+            d = int(s.get("d"))
             r = int(s.get("r", "0"))
-            total_segments += (1 + r)
+            for _ in range(1 + r):
+                segment_durations.append(d)
             
-    if total_segments == 0:
-        raise Exception("Could not determine total segments from SegmentTimeline")
+    if not segment_durations:
+        raise Exception("Could not determine segment durations from SegmentTimeline")
         
-    return init_url, media_url_template, start_number, total_segments
+    return init_url, media_url_template, start_number, segment_durations, timescale
 
 async def get_segment_size(client: httpx.AsyncClient, url: str) -> int:
     try:
@@ -133,11 +136,12 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
     
     if not byte_map:
         try:
-            init_url, media_url_template, start_number, total_segments = await fetch_and_parse_mpd(mpd_url)
+            init_url, media_url_template, start_number, segment_durations, timescale = await fetch_and_parse_mpd(mpd_url)
         except Exception as e:
             logger.error(f"DASH parsing failed for {track_id}: {e}")
             raise HTTPException(status_code=502, detail="Failed to parse upstream manifest")
 
+        total_segments = len(segment_durations)
         # Build the list of all media segment URLs
         media_urls = [
             media_url_template.replace("$Number$", str(start_number + i)) 
@@ -164,14 +168,11 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
             # 3. Build the sidx box
             reference_count = len(segment_sizes)
             body = bytearray()
-            timescale = 48000 # Tidal typical timescale
             body.extend(struct.pack(">IIIIHH", 1, timescale, 0, 0, 0, reference_count))
             
-            for size in segment_sizes:
+            for i, size in enumerate(segment_sizes):
                 ref_info = size & 0x7FFFFFFF
-                # Standard Tidal segment duration is 192000 (4 seconds at 48kHz)
-                # ExoPlayer uses this to map timestamps to bytes
-                subseg_duration = 192000 
+                subseg_duration = segment_durations[i]
                 sap_info = 0x90000000
                 body.extend(struct.pack(">III", ref_info, subseg_duration, sap_info))
                 
