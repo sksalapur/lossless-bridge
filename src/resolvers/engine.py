@@ -10,6 +10,7 @@ class ResolverEngine:
         self.resolvers = []
         self._track_cache = {}  # track_id -> {title, artist, album}
         self._stream_url_cache = {}  # track_id -> upstream_url
+        self._byte_map_cache = {} # track_id -> byte map dictionary
         priorities = [p.strip().lower() for p in settings.resolver_priority.split(",")]
         
         for p in priorities:
@@ -73,3 +74,12 @@ class ResolverEngine:
     def get_cached_stream_url(self, track_id: str) -> str:
         """Return cached upstream stream URL, or None."""
         return self._stream_url_cache.get(track_id)
+
+    def cache_byte_map(self, track_id: str, byte_map: dict):
+        self._byte_map_cache[track_id] = byte_map
+        if len(self._byte_map_cache) > 256:
+            oldest = next(iter(self._byte_map_cache))
+            del self._byte_map_cache[oldest]
+            
+    def get_cached_byte_map(self, track_id: str) -> Optional[dict]:
+        return self._byte_map_cache.get(track_id)

@@ -110,28 +110,96 @@ async def get_segment_size(client: httpx.AsyncClient, url: str) -> int:
         pass
     return 0
 
+import struct
+
 @router.get("/{secret}/file/{track_id}", name="proxy_dash")
 async def proxy_dash(secret: str, track_id: str, request: Request):
     """
-    Downloads all DASH segments on the fly and pipes them as a single continuous file.
-    Supports fast Range requests by concurrently mapping segment sizes via HEAD requests!
+    Downloads DASH segments on the fly and pipes them as a single continuous file.
+    Dynamically injects a `sidx` (Segment Index) box to make the fMP4 file fully seekable!
     """
     verify_secret(secret)
     mpd_url = engine.get_cached_stream_url(track_id)
     if not mpd_url:
-        logger.info(f"MPD URL for {track_id} not in cache (multi-worker miss?), resolving dynamically...")
+        logger.info(f"MPD URL for {track_id} not in cache, resolving dynamically...")
         stream_data = await engine.resolve_stream_url(track_id)
         if not stream_data or not stream_data.get("url"):
             raise HTTPException(status_code=404, detail="Could not resolve stream URL")
         mpd_url = stream_data["url"]
         engine.cache_stream_url(track_id, mpd_url)
 
-    try:
-        init_url, media_url_template, start_number, total_segments = await fetch_and_parse_mpd(mpd_url)
-    except Exception as e:
-        logger.error(f"DASH parsing failed for {track_id}: {e}")
-        raise HTTPException(status_code=502, detail="Failed to parse upstream manifest")
+    # Check cache for byte map
+    byte_map = engine.get_cached_byte_map(track_id)
+    
+    if not byte_map:
+        try:
+            init_url, media_url_template, start_number, total_segments = await fetch_and_parse_mpd(mpd_url)
+        except Exception as e:
+            logger.error(f"DASH parsing failed for {track_id}: {e}")
+            raise HTTPException(status_code=502, detail="Failed to parse upstream manifest")
 
+        # Build the list of all media segment URLs
+        media_urls = [
+            media_url_template.replace("$Number$", str(start_number + i)) 
+            for i in range(total_segments)
+        ]
+
+        # 1. Fetch the init segment fully (it's tiny, ~800 bytes)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(init_url)
+            if resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="Failed to fetch init segment")
+            init_data = resp.content
+            
+            # 2. Get the sizes of all media segments concurrently
+            logger.info(f"Building byte map and sidx box for {track_id} ({total_segments} segments)...")
+            tasks = [get_segment_size(client, u) for u in media_urls]
+            segment_sizes = await asyncio.gather(*tasks)
+
+        # Ensure all sizes were retrieved successfully
+        if 0 in segment_sizes:
+            logger.warning("Failed to retrieve some segment sizes. Seek capability will be disabled.")
+            sidx_data = b""
+        else:
+            # 3. Build the sidx box
+            reference_count = len(segment_sizes)
+            body = bytearray()
+            timescale = 48000 # Tidal typical timescale
+            body.extend(struct.pack(">IIIIHH", 1, timescale, 0, 0, 0, reference_count))
+            
+            for size in segment_sizes:
+                ref_info = size & 0x7FFFFFFF
+                # Standard Tidal segment duration is 192000 (4 seconds at 48kHz)
+                # ExoPlayer uses this to map timestamps to bytes
+                subseg_duration = 192000 
+                sap_info = 0x90000000
+                body.extend(struct.pack(">III", ref_info, subseg_duration, sap_info))
+                
+            box_size = 12 + len(body)
+            header = struct.pack(">I4sI", box_size, b'sidx', 0)
+            sidx_data = header + body
+            
+        # 4. Construct byte offsets
+        segments_info = []
+        current_offset = len(init_data) + len(sidx_data)
+        for i, size in enumerate(segment_sizes):
+            segments_info.append({
+                "url": media_urls[i],
+                "offset": current_offset,
+                "size": size
+            })
+            if size > 0:
+                current_offset += size
+                
+        byte_map = {
+            "init_data": init_data,
+            "sidx_data": sidx_data,
+            "segments": segments_info,
+            "total_size": current_offset if 0 not in segment_sizes else None
+        }
+        engine.cache_byte_map(track_id, byte_map)
+
+    # --- Serve the stream ---
     range_header = request.headers.get("Range")
     start_byte = 0
     end_byte = None
@@ -141,72 +209,69 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
             start_byte = int(parts[0])
         if len(parts) > 1 and parts[1]:
             end_byte = int(parts[1])
-
-    # Build the list of all segment URLs
-    urls = [init_url] + [
-        media_url_template.replace("$Number$", str(start_number + i)) 
-        for i in range(total_segments)
-    ]
-
+            
     async def stream_segments():
+        bytes_yielded = 0
+        current_byte_pos = start_byte
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            bytes_to_skip_globally = start_byte
-            start_url_index = 0
-            
-            if start_byte > 0:
-                logger.info(f"Mapping segment sizes for {track_id} to satisfy Range {start_byte}-")
+            # Yield init data if requested
+            if current_byte_pos < len(byte_map["init_data"]):
+                skip = current_byte_pos
+                chunk = byte_map["init_data"][skip:]
+                if end_byte is not None:
+                    remaining = (end_byte - current_byte_pos + 1) - bytes_yielded
+                    chunk = chunk[:remaining]
+                yield chunk
+                bytes_yielded += len(chunk)
+                current_byte_pos += len(chunk)
                 
-                # Fetch sizes concurrently in batches of 10
-                sizes = []
-                for i in range(0, len(urls), 10):
-                    batch = urls[i:i+10]
-                    tasks = [get_segment_size(client, u) for u in batch]
-                    batch_sizes = await asyncio.gather(*tasks)
-                    
-                    for size in batch_sizes:
-                        if size == 0:
-                            break
-                        sizes.append(size)
-                    
-                    if len(sizes) < len(batch):
-                        break # Stopped early due to failure or missing Content-Length
-                        
-                    if sum(sizes) > start_byte:
-                        break
+                if end_byte is not None and bytes_yielded >= (end_byte - start_byte + 1):
+                    return
 
-                # Safely skip entire segments that fall completely within the skip range
-                total_mapped = 0
-                for i, size in enumerate(sizes):
-                    if total_mapped + size <= bytes_to_skip_globally:
-                        total_mapped += size
-                        start_url_index = i + 1
-                    else:
-                        break
-                        
-                bytes_to_skip_globally -= total_mapped
-                logger.info(f"HEAD mapping skipped {start_url_index} segments ({total_mapped} bytes). Remaining to dynamically skip: {bytes_to_skip_globally}")
-
-            bytes_yielded = 0
-            urls_to_fetch = urls[start_url_index:]
-            
-            for seg_url in urls_to_fetch:
+            # Yield sidx data if requested
+            sidx_start_offset = len(byte_map["init_data"])
+            sidx_end_offset = sidx_start_offset + len(byte_map["sidx_data"])
+            if current_byte_pos < sidx_end_offset:
+                skip = current_byte_pos - sidx_start_offset
+                chunk = byte_map["sidx_data"][skip:]
+                if end_byte is not None:
+                    remaining = (end_byte - start_byte + 1) - bytes_yielded
+                    chunk = chunk[:remaining]
+                yield chunk
+                bytes_yielded += len(chunk)
+                current_byte_pos += len(chunk)
+                
+                if end_byte is not None and bytes_yielded >= (end_byte - start_byte + 1):
+                    return
+                    
+            # Stream media segments
+            for seg in byte_map["segments"]:
+                seg_start = seg["offset"]
+                seg_end = seg_start + seg["size"] if seg["size"] > 0 else float('inf')
+                
+                if current_byte_pos >= seg_end:
+                    continue # Segment is entirely before our current position
+                    
+                # We need to stream this segment
                 try:
-                    async with client.stream("GET", seg_url) as resp:
+                    async with client.stream("GET", seg["url"]) as resp:
                         if resp.status_code != 200:
-                            logger.error(f"Segment failed: {resp.status_code} for {seg_url}")
+                            logger.error(f"Failed to fetch {seg['url']}")
                             break
                             
+                        # If size is known, we can verify boundaries
+                        bytes_skipped_in_seg = current_byte_pos - seg_start if current_byte_pos > seg_start else 0
+                        
                         async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            # Skip logic within the stream
-                            if bytes_to_skip_globally > 0:
-                                if len(chunk) <= bytes_to_skip_globally:
-                                    bytes_to_skip_globally -= len(chunk)
+                            if bytes_skipped_in_seg > 0:
+                                if len(chunk) <= bytes_skipped_in_seg:
+                                    bytes_skipped_in_seg -= len(chunk)
                                     continue
                                 else:
-                                    chunk = chunk[bytes_to_skip_globally:]
-                                    bytes_to_skip_globally = 0
-                                
-                            # Truncate logic if end_byte is specified
+                                    chunk = chunk[bytes_skipped_in_seg:]
+                                    bytes_skipped_in_seg = 0
+                                    
                             if end_byte is not None:
                                 remaining = (end_byte - start_byte + 1) - bytes_yielded
                                 if len(chunk) > remaining:
@@ -215,9 +280,10 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
                             if chunk:
                                 yield chunk
                                 bytes_yielded += len(chunk)
+                                current_byte_pos += len(chunk)
                                 
                             if end_byte is not None and bytes_yielded >= (end_byte - start_byte + 1):
-                                return # Reached end of requested range
+                                return
                 except Exception as e:
                     logger.error(f"Error streaming segment: {e}")
                     break
@@ -226,14 +292,25 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
         "Accept-Ranges": "bytes",
         "Content-Type": "audio/mp4"
     }
-    
     status_code = 200
+    
     if range_header:
         status_code = 206
         if end_byte is not None:
-            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/*"
+            total_str = str(byte_map["total_size"]) if byte_map["total_size"] else "*"
+            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{total_str}"
         else:
-            headers["Content-Range"] = f"bytes {start_byte}-/*"
+            total_str = str(byte_map["total_size"]) if byte_map["total_size"] else "*"
+            headers["Content-Range"] = f"bytes {start_byte}-/{total_str}"
+            
+    # Set Content-Length if we know the exact response size
+    if byte_map["total_size"]:
+        if end_byte is not None:
+            headers["Content-Length"] = str((end_byte - start_byte) + 1)
+        elif not range_header:
+            headers["Content-Length"] = str(byte_map["total_size"])
+        else:
+            headers["Content-Length"] = str(byte_map["total_size"] - start_byte)
 
     return StreamingResponse(
         stream_segments(), 
