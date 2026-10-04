@@ -5,6 +5,7 @@ from src.config.settings import settings
 import httpx
 import logging
 import re
+import asyncio
 import xml.etree.ElementTree as ET
 
 router = APIRouter()
@@ -41,21 +42,12 @@ async def search_tracks(secret: str, q: str = ""):
 
 @router.get("/{secret}/stream/{track_id}")
 async def stream_track(secret: str, track_id: str, request: Request):
-    """
-    Stream endpoint — acts as a bridge for BitChord.
-    BitChord's player can handle DASH manifests, but its background offline
-    downloader frequently fails on DASH streams from addons. 
-    
-    To fix downloads, we point BitChord to our own /file proxy endpoint 
-    which will stitch the DASH segments together on the fly into a single file!
-    """
     verify_secret(secret)
 
     stream_data = await engine.resolve_stream_url(track_id)
     if not stream_data:
         raise HTTPException(status_code=404, detail="Lossless stream not found")
 
-    # Save the upstream MPD url so the proxy can use it
     mpd_url = stream_data.get("url")
     if not mpd_url:
         raise HTTPException(status_code=404, detail="No URL in upstream response")
@@ -66,7 +58,6 @@ async def stream_track(secret: str, track_id: str, request: Request):
 
     logger.info(f"Stream resolved: telling BitChord to fetch single file from {file_url}")
 
-    # We tell BitChord it's a direct file (manifest: none) wrapped in m4a/mp4 container
     return {
         "url": file_url,
         "format": "m4a",
@@ -81,14 +72,12 @@ async def stream_track(secret: str, track_id: str, request: Request):
     }
 
 async def fetch_and_parse_mpd(mpd_url: str):
-    """Fetches the MPD and extracts segment URLs."""
     async with httpx.AsyncClient() as client:
         resp = await client.get(mpd_url)
         if resp.status_code != 200:
             raise Exception(f"Failed to fetch MPD: {resp.status_code}")
         xml_text = resp.text
         
-    # Remove XML namespaces to make parsing easier
     xml_text = re.sub(r'\sxmlns="[^"]+"', '', xml_text, count=1)
     root = ET.fromstring(xml_text)
     
@@ -96,11 +85,10 @@ async def fetch_and_parse_mpd(mpd_url: str):
     if segment_template is None:
         raise Exception("No SegmentTemplate found in MPD")
         
-    init_url = segment_template.get("initialization")
-    media_url_template = segment_template.get("media")
+    init_url = segment_template.get("initialization").replace("&amp;", "&")
+    media_url_template = segment_template.get("media").replace("&amp;", "&")
     start_number = int(segment_template.get("startNumber", "1"))
     
-    # Calculate total segments
     total_segments = 0
     timeline = segment_template.find(".//SegmentTimeline")
     if timeline is not None:
@@ -113,11 +101,20 @@ async def fetch_and_parse_mpd(mpd_url: str):
         
     return init_url, media_url_template, start_number, total_segments
 
+async def get_segment_size(client: httpx.AsyncClient, url: str) -> int:
+    try:
+        resp = await client.head(url)
+        if resp.status_code == 200 and "Content-Length" in resp.headers:
+            return int(resp.headers["Content-Length"])
+    except Exception:
+        pass
+    return 0
+
 @router.get("/{secret}/file/{track_id}", name="proxy_dash")
 async def proxy_dash(secret: str, track_id: str, request: Request):
     """
     Downloads all DASH segments on the fly and pipes them as a single continuous file.
-    Supports basic Range requests by skipping and truncating bytes dynamically.
+    Supports fast Range requests by concurrently mapping segment sizes via HEAD requests!
     """
     verify_secret(secret)
     mpd_url = engine.get_cached_stream_url(track_id)
@@ -130,10 +127,6 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
         logger.error(f"DASH parsing failed for {track_id}: {e}")
         raise HTTPException(status_code=502, detail="Failed to parse upstream manifest")
 
-    init_url = init_url.replace("&amp;", "&")
-    media_url_template = media_url_template.replace("&amp;", "&")
-
-    # Parse Range header (e.g., "bytes=65536-1048575" or "bytes=65536-")
     range_header = request.headers.get("Range")
     start_byte = 0
     end_byte = None
@@ -144,18 +137,61 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
         if len(parts) > 1 and parts[1]:
             end_byte = int(parts[1])
 
+    # Build the list of all segment URLs
+    urls = [init_url] + [
+        media_url_template.replace("$Number$", str(start_number + i)) 
+        for i in range(total_segments)
+    ]
+
     async def stream_segments():
-        bytes_yielded = 0
-        bytes_skipped = 0
-        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # We'll put the init URL and all media URLs in a single list
-            urls = [init_url] + [
-                media_url_template.replace("$Number$", str(start_number + i)) 
-                for i in range(total_segments)
-            ]
+            # Determine which segments to skip by mapping their sizes dynamically.
+            # We ONLY do this if a start_byte > 0 is requested, to save time on normal playback/downloads.
+            skip_bytes = 0
+            start_url_index = 0
             
-            for seg_url in urls:
+            if start_byte > 0:
+                logger.info(f"Mapping segment sizes for {track_id} to satisfy Range {start_byte}-")
+                
+                # Fetch sizes concurrently in batches of 10 to avoid overwhelming the CDN
+                sizes = []
+                for i in range(0, len(urls), 10):
+                    batch = urls[i:i+10]
+                    tasks = [get_segment_size(client, u) for u in batch]
+                    batch_sizes = await asyncio.gather(*tasks)
+                    
+                    for size in batch_sizes:
+                        if size == 0:
+                            # If a HEAD request fails, fallback to streaming from current point
+                            break
+                        sizes.append(size)
+                    
+                    if len(sizes) < i + len(batch):
+                        break # Stopped early due to failure
+                        
+                    # Check if we've mapped enough bytes
+                    total_mapped = sum(sizes)
+                    if total_mapped > start_byte:
+                        break
+
+                # Calculate offset
+                total = 0
+                for i, size in enumerate(sizes):
+                    if total + size > start_byte:
+                        start_url_index = i
+                        skip_bytes = start_byte - total
+                        break
+                    total += size
+                    
+                # If we mapped everything but still didn't reach start_byte (e.g. range out of bounds)
+                if start_url_index == 0 and skip_bytes == 0 and sum(sizes) > 0 and sum(sizes) <= start_byte:
+                    logger.warning(f"Requested start_byte {start_byte} exceeds mapped total size {sum(sizes)}")
+                    return # EOF
+
+            bytes_yielded = 0
+            urls_to_fetch = urls[start_url_index:]
+            
+            for seg_url in urls_to_fetch:
                 try:
                     async with client.stream("GET", seg_url) as resp:
                         if resp.status_code != 200:
@@ -163,14 +199,14 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
                             break
                             
                         async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            # Skip logic
-                            if bytes_skipped + len(chunk) <= start_byte:
-                                bytes_skipped += len(chunk)
-                                continue
-                            elif bytes_skipped < start_byte:
-                                skip = start_byte - bytes_skipped
-                                chunk = chunk[skip:]
-                                bytes_skipped = start_byte
+                            # Skip logic within the exact segment
+                            if skip_bytes > 0:
+                                if len(chunk) <= skip_bytes:
+                                    skip_bytes -= len(chunk)
+                                    continue
+                                else:
+                                    chunk = chunk[skip_bytes:]
+                                    skip_bytes = 0
                                 
                             # Truncate logic if end_byte is specified
                             if end_byte is not None:
