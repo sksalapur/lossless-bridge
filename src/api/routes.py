@@ -58,12 +58,10 @@ async def stream_track(secret: str, track_id: str):
     if not stream_data:
         raise HTTPException(status_code=404, detail="Lossless stream not found or invalid")
 
-    # If LastWave provides a dataUrl (inline base64 manifest), we can use it 
-    # directly as the url to save BitChord a network request, but if not we
-    # just return what LastWave gave us.
-    if stream_data.get("dataUrl"):
-        stream_data["url"] = stream_data["dataUrl"]
-        del stream_data["dataUrl"]
+    # Do NOT overwrite url with dataUrl. BitChord's client strictly requires 
+    # the url field to be an HTTP/HTTPS URL and will reject data: URIs as malformed.
+    # The upstream JSON already has `url` pointing to an https:// link for the .mpd file,
+    # which we just verified works perfectly without any custom HMAC headers.
 
     logger.info(
         f"Stream resolved for track {track_id}: "
