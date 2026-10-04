@@ -119,7 +119,12 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
     verify_secret(secret)
     mpd_url = engine.get_cached_stream_url(track_id)
     if not mpd_url:
-        raise HTTPException(status_code=404, detail="MPD URL not found in cache")
+        logger.info(f"MPD URL for {track_id} not in cache (multi-worker miss?), resolving dynamically...")
+        stream_data = await engine.resolve_stream_url(track_id)
+        if not stream_data or not stream_data.get("url"):
+            raise HTTPException(status_code=404, detail="Could not resolve stream URL")
+        mpd_url = stream_data["url"]
+        engine.cache_stream_url(track_id, mpd_url)
 
     try:
         init_url, media_url_template, start_number, total_segments = await fetch_and_parse_mpd(mpd_url)
