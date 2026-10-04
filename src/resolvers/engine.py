@@ -9,6 +9,7 @@ class ResolverEngine:
     def __init__(self):
         self.resolvers = []
         self._track_cache = {}  # track_id -> {title, artist, album}
+        self._stream_url_cache = {}  # track_id -> upstream_url
         priorities = [p.strip().lower() for p in settings.resolver_priority.split(",")]
         
         for p in priorities:
@@ -58,3 +59,15 @@ class ResolverEngine:
     def get_cached_track(self, track_id: str) -> dict:
         """Return cached track metadata from a previous search, or empty dict."""
         return self._track_cache.get(track_id, {})
+
+    def cache_stream_url(self, track_id: str, url: str):
+        """Cache the upstream URL so the /file proxy can retrieve it."""
+        self._stream_url_cache[track_id] = url
+        # Bound the cache to prevent memory leaks
+        if len(self._stream_url_cache) > 256:
+            oldest = next(iter(self._stream_url_cache))
+            del self._stream_url_cache[oldest]
+
+    def get_cached_stream_url(self, track_id: str) -> str:
+        """Return cached upstream stream URL, or None."""
+        return self._stream_url_cache.get(track_id)
