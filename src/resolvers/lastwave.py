@@ -65,7 +65,7 @@ class LastWaveResolver(BaseResolver):
             logger.error(f"LastWave resolver search error: {e}")
         return []
 
-    async def get_stream(self, track_id: str) -> Optional[str]:
+    async def get_stream(self, track_id: str) -> Optional[Dict[str, Any]]:
         if not self.addon_url:
             return None
             
@@ -76,9 +76,8 @@ class LastWaveResolver(BaseResolver):
                 # Quality 27 = Hi-Res 192k
                 resp = await client.get(url, params={"quality": "27"}, headers=headers)
                 if resp.status_code == 200:
-                    data = resp.json()
-                    # We return the URL here, but it will be validated by the engine/proxy
-                    return data.get("url")
+                    # Return the full stream data object
+                    return resp.json()
         except Exception as e:
             logger.error(f"LastWave resolver get_stream error: {e}")
         return None

@@ -36,23 +36,25 @@ class ResolverEngine:
                 logger.error(f"Error in resolver {resolver.name} search: {e}")
         return []
 
-    async def resolve_stream_url(self, composite_track_id: str):
+    async def resolve_stream_url(self, composite_track_id: str) -> Optional[Dict[str, Any]]:
         """
-        Resolves a track ID to an upstream stream URL.
-        Tries all resolvers until one returns a valid URL.
+        Resolves a track ID to the full stream dictionary from the resolver.
+        Tries all resolvers until one returns valid data.
         """
         for resolver in self.resolvers:
-            stream_url = await resolver.get_stream(composite_track_id)
-            if not stream_url:
+            stream_data = await resolver.get_stream(composite_track_id)
+            if not stream_data:
                 continue
                 
+            stream_url = stream_data.get("url", "")
+            
             # Quick check if it's a known prank URL
             if "pranks-cdn" in stream_url.lower() or "definatelynagato" in stream_url.lower():
                 logger.warning(f"[{resolver.name}] Prank URL detected, skipping: {stream_url}")
                 continue
                 
-            logger.info(f"[{resolver.name}] Resolved stream URL for track {composite_track_id}")
-            return stream_url
+            logger.info(f"[{resolver.name}] Resolved stream data for track {composite_track_id}")
+            return stream_data
                 
         return None
 
