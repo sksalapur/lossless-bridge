@@ -6,7 +6,7 @@ from src.validation.flac_validator import FLACValidator
 
 logger = logging.getLogger(__name__)
 
-async def stream_proxy(url: str, range_header: str = None):
+async def stream_proxy(url: str, range_header: str = None, filename: str = None):
     """
     Proxies a stream from the upstream URL, supporting Range requests.
     Validates that the stream is actually FLAC on initial request (or range 0-).
@@ -83,6 +83,14 @@ async def stream_proxy(url: str, range_header: str = None):
         
     # Force content type to audio/flac for valid streams
     resp_headers["Content-Type"] = "audio/flac"
+    
+    # Set Content-Disposition for download support
+    if filename:
+        # Sanitize filename: remove filesystem-unsafe characters
+        safe_name = "".join(c for c in filename if c not in '\\/:*?"<>|').strip()
+        if not safe_name or not safe_name.endswith(".flac"):
+            safe_name = (safe_name or "download") + ".flac"
+        resp_headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
     
     return StreamingResponse(
         gen, 

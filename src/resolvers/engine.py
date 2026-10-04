@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 class ResolverEngine:
     def __init__(self):
         self.resolvers = []
+        self._track_cache = {}  # track_id -> {title, artist, album}
         priorities = [p.strip().lower() for p in settings.resolver_priority.split(",")]
         
         for p in priorities:
@@ -29,17 +30,26 @@ class ResolverEngine:
                     # Enrich results with resolver ID so we know which one to stream from
                     for r in results:
                         r["_resolver"] = resolver.name
+                        # Cache track metadata for download filename generation
+                        track_id = str(r.get("id", ""))
+                        if track_id:
+                            self._track_cache[track_id] = {
+                                "title": r.get("title", ""),
+                                "artist": r.get("performerName", r.get("artist", "")),
+                                "album": r.get("albumTitle", r.get("album", "")),
+                            }
                     return results
             except Exception as e:
                 logger.error(f"Error in resolver {resolver.name} search: {e}")
         return []
 
-    async def get_stream(self, composite_track_id: str, range_header: str = None):
+    async def resolve_stream_url(self, composite_track_id: str):
         """
+        Resolves a track ID to an upstream stream URL.
         composite_track_id could be just the ID if we only have one resolver,
         or format like 'lastwave:12345'. We'll assume the primary resolver for now.
         """
-        # Simply try all resolvers until one gives a valid stream
+        # Try all resolvers until one gives a valid stream URL
         for resolver in self.resolvers:
             stream_url = await resolver.get_stream(composite_track_id)
             if not stream_url:
@@ -50,9 +60,12 @@ class ResolverEngine:
                 logger.warning(f"[{resolver.name}] Prank URL detected, skipping: {stream_url}")
                 continue
                 
-            # If it's a legitimate URL (like a pre-signed S3/DASH manifest), 
-            # return it directly so the client can resolve relative DASH segments properly.
+            logger.info(f"[{resolver.name}] Resolved stream URL for track {composite_track_id}")
             return stream_url
                 
         # If all fail, return None so the route can throw 404
         return None
+
+    def get_cached_track(self, track_id: str) -> dict:
+        """Return cached track metadata from a previous search, or empty dict."""
+        return self._track_cache.get(track_id, {})
