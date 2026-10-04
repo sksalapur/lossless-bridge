@@ -5,6 +5,8 @@ from src.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+from src.matching.cleaner import generate_search_variations
+
 class ResolverEngine:
     def __init__(self):
         self.resolvers = []
@@ -18,23 +20,27 @@ class ResolverEngine:
                 self.resolvers.append(LastWaveResolver())
             
     async def search(self, query: str) -> List[Dict[str, Any]]:
+        variations = generate_search_variations(query)
+        
         for resolver in self.resolvers:
-            try:
-                results = await resolver.search(query)
-                if results:
-                    for r in results:
-                        r["_resolver"] = resolver.name
-                        # Cache track metadata for potential future use
-                        track_id = str(r.get("id", ""))
-                        if track_id:
-                            self._track_cache[track_id] = {
-                                "title": r.get("title", ""),
-                                "artist": r.get("performerName", r.get("artist", "")),
-                                "album": r.get("albumTitle", r.get("album", "")),
-                            }
-                    return results
-            except Exception as e:
-                logger.error(f"Error in resolver {resolver.name} search: {e}")
+            for v in variations:
+                try:
+                    logger.info(f"Searching {resolver.name} for: '{v}'")
+                    results = await resolver.search(v)
+                    if results:
+                        for r in results:
+                            r["_resolver"] = resolver.name
+                            # Cache track metadata for potential future use
+                            track_id = str(r.get("id", ""))
+                            if track_id:
+                                self._track_cache[track_id] = {
+                                    "title": r.get("title", ""),
+                                    "artist": r.get("performerName", r.get("artist", "")),
+                                    "album": r.get("albumTitle", r.get("album", "")),
+                                }
+                        return results
+                except Exception as e:
+                    logger.error(f"Error in resolver {resolver.name} search: {e}")
         return []
 
     async def resolve_stream_url(self, composite_track_id: str) -> Optional[Dict[str, Any]]:
