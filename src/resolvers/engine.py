@@ -1,5 +1,5 @@
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from src.resolvers.lastwave import LastWaveResolver
 from src.config.settings import settings
 
