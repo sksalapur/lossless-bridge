@@ -114,9 +114,10 @@ async def fetch_and_parse_mpd(mpd_url: str):
     return init_url, media_url_template, start_number, total_segments
 
 @router.get("/{secret}/file/{track_id}", name="proxy_dash")
-async def proxy_dash(secret: str, track_id: str):
+async def proxy_dash(secret: str, track_id: str, request: Request):
     """
     Downloads all DASH segments on the fly and pipes them as a single continuous file.
+    Supports basic Range requests by skipping and truncating bytes dynamically.
     """
     verify_secret(secret)
     mpd_url = engine.get_cached_stream_url(track_id)
@@ -129,44 +130,79 @@ async def proxy_dash(secret: str, track_id: str):
         logger.error(f"DASH parsing failed for {track_id}: {e}")
         raise HTTPException(status_code=502, detail="Failed to parse upstream manifest")
 
-    # Replace XML entities if they exist
     init_url = init_url.replace("&amp;", "&")
     media_url_template = media_url_template.replace("&amp;", "&")
 
-    async def stream_segments():
-        # Using a single client for connection pooling across the 70+ segments
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # 1. Stream the initialization segment
-            try:
-                async with client.stream("GET", init_url) as resp:
-                    if resp.status_code == 200:
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            yield chunk
-                    else:
-                        logger.error(f"Init segment failed: {resp.status_code}")
-                        return
-            except Exception as e:
-                logger.error(f"Error streaming init segment: {e}")
-                return
+    # Parse Range header (e.g., "bytes=65536-1048575" or "bytes=65536-")
+    range_header = request.headers.get("Range")
+    start_byte = 0
+    end_byte = None
+    if range_header and range_header.startswith("bytes="):
+        parts = range_header.replace("bytes=", "").split("-")
+        if parts[0]:
+            start_byte = int(parts[0])
+        if len(parts) > 1 and parts[1]:
+            end_byte = int(parts[1])
 
-            # 2. Stream all media segments sequentially
-            for i in range(total_segments):
-                seg_num = start_number + i
-                seg_url = media_url_template.replace("$Number$", str(seg_num))
+    async def stream_segments():
+        bytes_yielded = 0
+        bytes_skipped = 0
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # We'll put the init URL and all media URLs in a single list
+            urls = [init_url] + [
+                media_url_template.replace("$Number$", str(start_number + i)) 
+                for i in range(total_segments)
+            ]
+            
+            for seg_url in urls:
                 try:
                     async with client.stream("GET", seg_url) as resp:
-                        if resp.status_code == 200:
-                            async for chunk in resp.aiter_bytes(chunk_size=65536):
-                                yield chunk
-                        else:
-                            logger.error(f"Segment {seg_num} failed: {resp.status_code}")
+                        if resp.status_code != 200:
+                            logger.error(f"Segment failed: {resp.status_code} for {seg_url}")
                             break
+                            
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            # Skip logic
+                            if bytes_skipped + len(chunk) <= start_byte:
+                                bytes_skipped += len(chunk)
+                                continue
+                            elif bytes_skipped < start_byte:
+                                skip = start_byte - bytes_skipped
+                                chunk = chunk[skip:]
+                                bytes_skipped = start_byte
+                                
+                            # Truncate logic if end_byte is specified
+                            if end_byte is not None:
+                                remaining = (end_byte - start_byte + 1) - bytes_yielded
+                                if len(chunk) > remaining:
+                                    chunk = chunk[:remaining]
+                                    
+                            if chunk:
+                                yield chunk
+                                bytes_yielded += len(chunk)
+                                
+                            if end_byte is not None and bytes_yielded >= (end_byte - start_byte + 1):
+                                return # Reached end of requested range
                 except Exception as e:
-                    logger.error(f"Error streaming segment {seg_num}: {e}")
+                    logger.error(f"Error streaming segment: {e}")
                     break
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "audio/mp4"
+    }
+    
+    status_code = 200
+    if range_header:
+        status_code = 206
+        if end_byte is not None:
+            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/*"
+        else:
+            headers["Content-Range"] = f"bytes {start_byte}-/*"
 
     return StreamingResponse(
         stream_segments(), 
-        media_type="audio/mp4",
-        headers={"Accept-Ranges": "none"} # Prevent range requests since we generate on the fly
+        status_code=status_code,
+        headers=headers
     )
