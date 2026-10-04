@@ -3,6 +3,11 @@ from fastapi.responses import StreamingResponse
 from src.resolvers.engine import ResolverEngine
 from src.config.settings import settings
 import httpx
+import hmac
+import hashlib
+import time
+import re
+import urllib.parse
 import logging
 
 router = APIRouter()
@@ -16,6 +21,33 @@ async def health_check():
 def verify_secret(secret: str):
     if settings.bridge_secret and secret != settings.bridge_secret:
         raise HTTPException(status_code=404, detail="Not Found")
+
+def _sign_url(url: str, method: str = "GET") -> dict:
+    """Generate HMAC-signed headers for the LastWave addon, same as lastwave.py."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36 LastWave/1.0",
+        "Accept": "*/*",
+    }
+    
+    lw_secret = "36d96a751b12ee481c281a8a8e64c482d0c1634a22061ab72f40175017818b85"
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path if parsed.path else "/"
+    
+    match = re.search(r'/a/([^/]+)', path)
+    if match:
+        token = match.group(1)
+        ts = str(int(time.time()))
+        message = f"{ts}\n{method.upper()}\n{path}\n{token}"
+        signature = hmac.new(
+            lw_secret.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        headers["X-LW-TS"] = ts
+        headers["X-LW-Sign"] = signature
+    
+    return headers
 
 @router.get("/{secret}/manifest.json")
 async def get_manifest(secret: str):
@@ -41,18 +73,7 @@ async def search_tracks(secret: str, q: str = ""):
 async def stream_track(secret: str, track_id: str, request: Request):
     """
     Stream endpoint — returns JSON pointing to our own /file proxy.
-
-    BitChord uses /stream for BOTH playback and downloads. The reference
-    selfhosted addon (bitchord-selfhosted-addon) does the same thing:
-    its toStreamJSON() returns URL: base + "/file/" + track.ID — pointing
-    back to its own byte-level proxy, not a raw CDN link.
-
-    Key fields from the BitChord addon developer docs:
-      - url: absolute, directly playable media URL
-      - codec: "flac" (most reliable codec signal, step 1 in formatOf())
-      - container: "flac" (self-describing container)
-      - manifest: "none" (critical: tells BitChord it's NOT DASH/HLS)
-      - encrypted: false (required, protected renditions are refused)
+    Same pattern as the reference selfhosted addon's toStreamJSON().
     """
     verify_secret(secret)
 
@@ -64,13 +85,12 @@ async def stream_track(secret: str, track_id: str, request: Request):
     # Cache the upstream URL so /file can retrieve it
     engine.cache_stream_url(track_id, stream_url)
 
-    # Build the self-referencing proxy URL — same pattern as the reference addon
-    # The reference addon does: URL = base + "/file/" + track.ID
+    # Build the self-referencing proxy URL
     file_url = str(request.url_for("proxy_file", secret=secret, track_id=track_id))
 
     logger.info(
         f"Stream resolved for track {track_id}: "
-        f"upstream={stream_url[:80]}... → file={file_url}"
+        f"upstream={stream_url[:120]} → file={file_url}"
     )
 
     return {
@@ -89,19 +109,7 @@ async def stream_track(secret: str, track_id: str, request: Request):
 @router.get("/{secret}/file/{track_id}", name="proxy_file")
 async def proxy_file(secret: str, track_id: str, request: Request):
     """
-    Byte-level file proxy — same role as /file in the reference selfhosted addon.
-
-    The reference addon's proxy.go:
-    1. Resolves the track from its library
-    2. Calls Backend.OpenFile() to get an HTTP response from upstream
-    3. Forwards Range/If-Range request headers
-    4. Forwards Content-Type/Content-Length/Content-Range/Accept-Ranges/ETag
-       response headers
-    5. Pipes upstream.Body to the client
-
-    We do the same: fetch from the cached upstream URL, forward range headers,
-    and pipe the bytes through without any content validation (the upstream
-    is already verified by the resolver's prank-URL detection).
+    Byte-level file proxy — pipes upstream audio to BitChord.
     """
     verify_secret(secret)
 
@@ -113,38 +121,52 @@ async def proxy_file(secret: str, track_id: str, request: Request):
         upstream_url = await engine.resolve_stream_url(track_id)
 
     if not upstream_url:
+        logger.error(f"No upstream URL for track {track_id} (not cached, resolve failed)")
         raise HTTPException(status_code=404, detail="Stream not found")
 
-    # Forward range headers like the reference addon does
-    upstream_headers = {}
+    logger.info(f"Proxy /file for track {track_id}: upstream={upstream_url[:120]}")
+
+    # Build headers: HMAC signing for lastwaveaddons URLs + Range forwarding
+    upstream_headers = _sign_url(upstream_url)
+    
     if request.headers.get("Range"):
         upstream_headers["Range"] = request.headers["Range"]
     if request.headers.get("If-Range"):
         upstream_headers["If-Range"] = request.headers["If-Range"]
 
     try:
-        client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
+        client = httpx.AsyncClient(follow_redirects=True, timeout=60.0)
         req = client.build_request("GET", upstream_url, headers=upstream_headers)
         resp = await client.send(req, stream=True)
 
+        logger.info(f"Upstream response for track {track_id}: status={resp.status_code} "
+                     f"content-type={resp.headers.get('Content-Type', 'unknown')} "
+                     f"content-length={resp.headers.get('Content-Length', 'unknown')}")
+
         if resp.status_code not in (200, 206, 416):
-            logger.error(f"Upstream returned {resp.status_code} for track {track_id}")
+            body_preview = ""
+            try:
+                chunk = await resp.aread()
+                body_preview = chunk[:256].decode("utf-8", errors="replace")
+            except:
+                pass
+            logger.error(f"Upstream returned {resp.status_code} for track {track_id}: {body_preview}")
             await resp.aclose()
             await client.aclose()
-            raise HTTPException(status_code=502, detail="Upstream error")
+            raise HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}")
 
-        # Forward response headers like the reference addon's proxy.go
+        # Forward response headers
         forwarded_headers = {}
         for name in ("Content-Type", "Content-Length", "Content-Range",
                       "Accept-Ranges", "ETag", "Last-Modified"):
             if name in resp.headers:
                 forwarded_headers[name] = resp.headers[name]
 
-        # Override Content-Type to audio/flac if upstream doesn't set it properly
-        if "Content-Type" not in forwarded_headers or "flac" not in forwarded_headers.get("Content-Type", ""):
+        # Ensure correct content type
+        ct = forwarded_headers.get("Content-Type", "")
+        if "flac" not in ct and "octet" not in ct and "audio" not in ct:
             forwarded_headers["Content-Type"] = "audio/flac"
 
-        # Ensure Accept-Ranges is set for seeking support
         if "Accept-Ranges" not in forwarded_headers:
             forwarded_headers["Accept-Ranges"] = "bytes"
 
@@ -156,8 +178,6 @@ async def proxy_file(secret: str, track_id: str, request: Request):
                 await resp.aclose()
                 await client.aclose()
 
-        logger.info(f"Proxying track {track_id}: status={resp.status_code}")
-
         return StreamingResponse(
             pipe_upstream(),
             status_code=resp.status_code,
@@ -165,5 +185,5 @@ async def proxy_file(secret: str, track_id: str, request: Request):
         )
 
     except httpx.HTTPError as e:
-        logger.error(f"HTTP error proxying track {track_id}: {e}")
-        raise HTTPException(status_code=502, detail="Upstream connection failed")
+        logger.error(f"HTTP error proxying track {track_id}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=502, detail=f"Upstream connection failed: {type(e).__name__}")
