@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from src.resolvers.engine import ResolverEngine
 from src.config.settings import settings
 import httpx
@@ -135,11 +135,21 @@ async def proxy_dash(secret: str, track_id: str, request: Request):
     byte_map = engine.get_cached_byte_map(track_id)
     
     if not byte_map:
+        is_dash = ".mpd" in mpd_url or "manifest" in mpd_url or "dash" in mpd_url.lower()
+        if not is_dash:
+            # LastWave sometimes returns direct .m4a or .flac files (e.g. from cache or fallback CDNs)
+            # We don't need to inject a sidx box for these because they are already complete files!
+            # We can just redirect or proxy directly.
+            logger.info(f"URL {mpd_url} does not look like an MPD. Returning direct redirect.")
+            return RedirectResponse(mpd_url)
+
         try:
             init_url, media_url_template, start_number, segment_durations, timescale = await fetch_and_parse_mpd(mpd_url)
         except Exception as e:
-            logger.error(f"DASH parsing failed for {track_id}: {e}")
-            raise HTTPException(status_code=502, detail="Failed to parse upstream manifest")
+            # If it failed to parse, maybe it wasn't XML after all.
+            logger.error(f"DASH parsing failed for {track_id} (URL: {mpd_url}): {e}")
+            logger.info("Falling back to direct redirect...")
+            return RedirectResponse(mpd_url)
 
         total_segments = len(segment_durations)
         # Build the list of all media segment URLs
